@@ -202,7 +202,12 @@ def run_online(cfg: AppConfig) -> None:
                 break
 
             current_step = t - context_length
-            ts = df_diff.index[t]
+
+            # The context contains diffs up to index (t-1). So "now" is df_diff.index[t-1],
+            # and the forecast horizon corresponds to df_diff.index[t ... t+h-1].
+            ts_now = df_diff.index[t - 1]
+            horizon_timestamps = list(df_diff.index[t : t + prediction_horizon])
+            ts_t1 = horizon_timestamps[0]
 
             # Forecast: scaled diffs
             preds_scaled = _predict_multistep_direct(
@@ -220,12 +225,8 @@ def run_online(cfg: AppConfig) -> None:
                     row.append(float(f_scalers[var].inverse_transform([[step_pred[i]]])[0, 0]))
                 preds_diff.append(np.array(row))
 
-            # Actual diff (t+1)
-            actual_diff_t1 = df_diff.iloc[t + 1][variables].to_numpy(dtype=float)
-
-            # Inverse differencing (use last actual values from raw)
-            base_idx = min(t, len(df_forecasting) - 1)
-            last_actual = df_forecasting.iloc[base_idx][variables].to_numpy(dtype=float)
+            # Base actual at "now" timestamp
+            last_actual = df_forecasting.loc[ts_now, variables].to_numpy(dtype=float)
 
             preds_actual = []
             cur = last_actual.copy()
@@ -233,14 +234,16 @@ def run_online(cfg: AppConfig) -> None:
                 cur = cur + step_diff
                 preds_actual.append(cur.copy())
 
-            actual_actual_t1 = last_actual + actual_diff_t1
+            # Metrics + plotting alignment (forecast-style):
+            # prediction made at ts_now for ts_t1 is plotted at ts_t1 and scored against actual(ts_t1).
+            actual_t1 = df_forecasting.loc[ts_t1, variables].to_numpy(dtype=float)
 
             # Classification on most recent window (raw, not differenced)
             cls_result = None
             try:
                 # Align by timestamp index if possible; fallback to positional
-                if ts in df_classification.index:
-                    end_loc = df_classification.index.get_loc(ts)
+                if ts_now in df_classification.index:
+                    end_loc = df_classification.index.get_loc(ts_now)
                 else:
                     end_loc = min(t, len(df_classification) - 1)
 
@@ -263,7 +266,7 @@ def run_online(cfg: AppConfig) -> None:
                 name = c_prep.get("label_to_name", {}).get(idx, f"class_{idx}")
 
                 cls_result = {
-                    "timestamp": str(ts),
+                    "timestamp": str(ts_now),
                     "classification": name,
                     "confidence": conf,
                     "class_index": idx,
@@ -271,13 +274,19 @@ def run_online(cfg: AppConfig) -> None:
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 print(f"Classification error: {msg}")
-                exceptions.append({"where": "classification", "timestamp": str(ts), "message": msg})
+                exceptions.append({"where": "classification", "timestamp": str(ts_now), "message": msg})
 
-        # Push to dashboard (t+1 actual + horizon predictions)
+        # Push to dashboard:
+        # - actual at ts_now (blue)
+        # - pred(t+1) at ts_t1 (green)
+        # - full horizon pred(t+1..t+6) displayed on horizon_timestamps (red)
             plotter.add_step(
-                timestamp=ts,
+                timestamp=ts_now,
                 variable_names=variables,
-                actual_row=actual_actual_t1,
+                actual_row=last_actual,
+                pred1_timestamp=ts_t1,
+                pred1_row=preds_actual[0],
+                horizon_timestamps=horizon_timestamps,
                 predictions_horizon=preds_actual,
                 current_step=current_step,
                 classification_result=cls_result,
@@ -285,8 +294,8 @@ def run_online(cfg: AppConfig) -> None:
 
             records.append(
                 _StepRecord(
-                    timestamp=pd.Timestamp(ts),
-                    actual_t1=np.array(actual_actual_t1, dtype=float),
+                    timestamp=pd.Timestamp(ts_t1),
+                    actual_t1=np.array(actual_t1, dtype=float),
                     pred_t1=np.array(preds_actual[0], dtype=float),
                     classification=(cls_result or {}).get("classification") if cls_result else None,
                     confidence=(cls_result or {}).get("confidence") if cls_result else None,

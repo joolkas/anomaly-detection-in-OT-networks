@@ -19,7 +19,15 @@ class DashRealTimePlotter:
 
         self.timestamps = deque(maxlen=max_points)
         self.actual_values: dict[str, deque] = {}
-        self.temporal_predictions: dict[str, deque] = {}
+
+        # Stored one-step-ahead predictions (used for metrics, shown historically)
+        self.pred1_timestamps = deque(maxlen=max_points)
+        self.pred1_values: dict[str, deque] = {}
+
+        # Current horizon predictions (shown as a future projection; not stored historically)
+        self.horizon_timestamps: list = []
+        self.horizon_values: dict[str, list[float]] = {}
+
         self.variable_names: list[str] = []
 
         self.classification_results = deque(maxlen=50)
@@ -55,6 +63,9 @@ class DashRealTimePlotter:
         timestamp,
         variable_names: list[str],
         actual_row,
+        pred1_timestamp,
+        pred1_row,
+        horizon_timestamps: list,
         predictions_horizon,
         current_step: int,
         classification_result: dict | None,
@@ -64,16 +75,23 @@ class DashRealTimePlotter:
             self.variable_names = variable_names
 
             self.timestamps.append(timestamp)
+            self.pred1_timestamps.append(pred1_timestamp)
+
+            self.horizon_timestamps = list(horizon_timestamps)
 
             # Init deques
             for v in variable_names:
                 self.actual_values.setdefault(v, deque(maxlen=self.max_points))
-                self.temporal_predictions.setdefault(v, deque(maxlen=self.max_points))
+                self.pred1_values.setdefault(v, deque(maxlen=self.max_points))
+                self.horizon_values.setdefault(v, [])
 
             for i, v in enumerate(variable_names):
                 self.actual_values[v].append(float(actual_row[i]))
-                # store t+1 prediction for simplicity
-                self.temporal_predictions[v].append(float(predictions_horizon[0][i]))
+                self.pred1_values[v].append(float(pred1_row[i]))
+
+            # Store current horizon prediction for display.
+            for i, v in enumerate(variable_names):
+                self.horizon_values[v] = [float(step[i]) for step in predictions_horizon]
 
             if classification_result is not None:
                 self.classification_results.append(classification_result)
@@ -135,7 +153,10 @@ class DashRealTimePlotter:
             variable_names = list(self.variable_names)
             timestamps = list(self.timestamps)
             actual_values = {k: list(v) for k, v in self.actual_values.items()}
-            temporal_predictions = {k: list(v) for k, v in self.temporal_predictions.items()}
+            pred1_timestamps = list(self.pred1_timestamps)
+            pred1_values = {k: list(v) for k, v in self.pred1_values.items()}
+            horizon_timestamps = list(self.horizon_timestamps)
+            horizon_values = {k: list(v) for k, v in self.horizon_values.items()}
 
         if not variable_names or not timestamps:
             return html.Div("Waiting for data...")
@@ -155,7 +176,12 @@ class DashRealTimePlotter:
                 col=col,
             )
             fig.add_trace(
-                go.Scatter(x=ts, y=list(temporal_predictions.get(v, [])), mode="lines+markers", name="pred(t+1)", line=dict(color="red"), showlegend=(i == 0)),
+                go.Scatter(x=pred1_timestamps, y=list(pred1_values.get(v, [])), mode="lines+markers", name="pred(t+1)", line=dict(color="#2ecc71"), showlegend=(i == 0)),
+                row=row,
+                col=col,
+            )
+            fig.add_trace(
+                go.Scatter(x=horizon_timestamps, y=list(horizon_values.get(v, [])), mode="lines+markers", name="pred(t+1..t+6)", line=dict(color="red"), showlegend=(i == 0)),
                 row=row,
                 col=col,
             )

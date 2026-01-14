@@ -52,6 +52,11 @@ class PreprocessingConfig:
     classification_exclude_keywords: tuple[str, ...]
     outlier_z_threshold: float
 
+    # Optional slicing of the minute-level wide table (after pivot/preprocess).
+    # Useful to "start from point N" for quicker experiments.
+    slice_start_row: int
+    slice_end_row: int | None
+
 
 @dataclass(frozen=True)
 class ForecastingModelConfig:
@@ -66,6 +71,19 @@ class ForecastingModelConfig:
     validation_split: float
     learning_rate: float
     initial_train_minutes: int
+
+    # Online monitoring / fine-tuning (optional)
+    online_error_window: int
+    online_error_mae_threshold: float
+    online_finetune_enabled: bool
+    online_finetune_train_samples: int
+    online_finetune_epochs: int
+    online_finetune_batch_size: int
+    online_finetune_learning_rate: float
+    online_finetune_cooldown_steps: int
+
+    # Terminal status printing
+    online_status_every_steps: int
 
 
 @dataclass(frozen=True)
@@ -114,6 +132,10 @@ def _require(d: dict[str, Any], key: str) -> Any:
     return d[key]
 
 
+def _optional(d: dict[str, Any], key: str, default: Any) -> Any:
+    return d.get(key, default)
+
+
 def load_config(config_path: Path | None = None) -> AppConfig:
     """Load JSON config.
 
@@ -155,7 +177,11 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         classification_include_keywords=tuple(_require(pre_raw, "classification_include_keywords")),
         classification_exclude_keywords=tuple(_require(pre_raw, "classification_exclude_keywords")),
         outlier_z_threshold=float(_require(pre_raw, "outlier_z_threshold")),
+        slice_start_row=int(_optional(pre_raw, "slice_start_row", 0)),
+        slice_end_row=_optional(pre_raw, "slice_end_row", None),
     )
+
+    base_lr = float(_require(f_raw, "learning_rate"))
 
     forecasting = ForecastingModelConfig(
         context_length=int(_require(f_raw, "context_length")),
@@ -167,8 +193,17 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         epochs=int(_require(f_raw, "epochs")),
         batch_size=int(_require(f_raw, "batch_size")),
         validation_split=float(_require(f_raw, "validation_split")),
-        learning_rate=float(_require(f_raw, "learning_rate")),
+        learning_rate=base_lr,
         initial_train_minutes=int(_require(f_raw, "initial_train_minutes")),
+        online_error_window=int(_optional(f_raw, "online_error_window", 60)),
+        online_error_mae_threshold=float(_optional(f_raw, "online_error_mae_threshold", 1.0)),
+        online_finetune_enabled=bool(_optional(f_raw, "online_finetune_enabled", False)),
+        online_finetune_train_samples=int(_optional(f_raw, "online_finetune_train_samples", 60)),
+        online_finetune_epochs=int(_optional(f_raw, "online_finetune_epochs", 1)),
+        online_finetune_batch_size=int(_optional(f_raw, "online_finetune_batch_size", 16)),
+        online_finetune_learning_rate=float(_optional(f_raw, "online_finetune_learning_rate", base_lr * 0.1)),
+        online_finetune_cooldown_steps=int(_optional(f_raw, "online_finetune_cooldown_steps", 60)),
+        online_status_every_steps=max(1, int(_optional(f_raw, "online_status_every_steps", 1))),
     )
 
     classification = ClassificationModelConfig(

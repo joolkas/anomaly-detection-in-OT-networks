@@ -1,10 +1,10 @@
 {
   "run": {
-    "mode": "online"
+    "mode": "train-all"
   },
   "paths": {
     "raw_data_dir": "C:\\Przestrzeń pomoc\\projects\\anomaly-detection-in-OT-networks\\data\\raw",
-    "device_csv_name": "A1-SW-A-245.csv",
+    "device_csv_name": "A1-RBX-243.csv",
     "processed_dir": "./processed",
     "artifacts_dir": "./artifacts"
   },
@@ -27,7 +27,10 @@
     "classification_exclude_keywords": [
       "unused"
     ],
-    "outlier_z_threshold": 10.0
+    "outlier_z_threshold": 10.0,
+
+    "slice_start_row": 16000,
+    "slice_end_row": null
   },
   "forecasting": {
     "context_length": 60,
@@ -44,11 +47,21 @@
     "batch_size": 32,
     "validation_split": 0.2,
     "learning_rate": 0.001,
-    "initial_train_minutes": 1440
+    "initial_train_minutes": 1440,
+
+    "online_error_window": 60,
+    "online_error_mae_threshold": 1.0,
+    "online_finetune_enabled": true,
+    "online_finetune_train_samples": 60,
+    "online_finetune_epochs": 1,
+    "online_finetune_batch_size": 16,
+    "online_finetune_learning_rate": 0.0001,
+    "online_finetune_cooldown_steps": 60,
+    "online_status_every_steps": 1
   },
   "classification": {
     "window_size": 60,
-    "traffic_ratio_threshold": 100.0,
+    "traffic_ratio_threshold": 10.0,
     "start_bit": 10,
     "epsilon": 1e-6,
     "conv1_units": 64,

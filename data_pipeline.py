@@ -61,6 +61,15 @@ def prepare_and_save(cfg: AppConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     df_wide = pivot_minute(df_long, floor_freq=cfg.preprocessing.resample_freq)
     df = preprocess_wide(df_wide, cfg)
 
+    # Optional slicing (e.g. start from row 16000)
+    start = int(cfg.preprocessing.slice_start_row)
+    end = cfg.preprocessing.slice_end_row
+    if end is not None:
+        end = int(end)
+    if start or end is not None:
+        df = df.iloc[start:end].copy()
+        print(f"Applied preprocessing slice: rows [{start}:{end}] -> {len(df)} rows")
+
     forecasting_cols = select_columns_by_keywords(
         df.columns,
         include_keywords=cfg.preprocessing.forecasting_include_keywords,

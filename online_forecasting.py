@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import time
 
 import numpy as np
 import pandas as pd
+
+from tensorflow import keras
 
 from .config import AppConfig
 from .dashboard import DashRealTimePlotter
@@ -156,6 +159,16 @@ def run_online(cfg: AppConfig) -> None:
 
     df_classification = pd.read_csv(cfg.paths.processed_classification_csv, index_col=0, parse_dates=True)
 
+    # Optional slicing to start from point N (same as preprocessing slice).
+    start = int(getattr(cfg.preprocessing, "slice_start_row", 0) or 0)
+    end = getattr(cfg.preprocessing, "slice_end_row", None)
+    if end is not None:
+        end = int(end)
+    if start or end is not None:
+        df_forecasting = df_forecasting.iloc[start:end].copy()
+        df_classification = df_classification.iloc[start:end].copy()
+        print(f"[online] Applied data slice rows [{start}:{end}]")
+
     # Start dashboard
     plotter = DashRealTimePlotter(max_points=cfg.dashboard.max_points, update_interval_ms=cfg.dashboard.update_interval_ms)
     plotter.set_label_to_name(c_prep.get("label_to_name", {}))
@@ -191,6 +204,35 @@ def run_online(cfg: AppConfig) -> None:
     records: list[_StepRecord] = []
     exceptions: list[dict] = []
 
+    # Online monitoring + fine-tuning buffers
+    fcfg = cfg.forecasting
+    err_mae_window = deque(maxlen=int(fcfg.online_error_window))
+    err_rmse_window = deque(maxlen=int(fcfg.online_error_window))
+    train_X = deque(maxlen=int(fcfg.online_finetune_train_samples))
+    train_y = deque(maxlen=int(fcfg.online_finetune_train_samples))
+    last_finetune_step = -10**9
+
+    def _maybe_print_status(ts_now, step: int, mae_t1: float, rmse_t1: float) -> None:
+        every = int(getattr(fcfg, "online_status_every_steps", 1) or 1)
+        if step % every != 0:
+            return
+
+        w = int(fcfg.online_error_window)
+        if len(err_mae_window) >= w:
+            mae_w = float(np.mean(err_mae_window))
+            rmse_w = float(np.mean(err_rmse_window))
+            print(
+                f"[online] step={step} ts={ts_now} "
+                f"mae_t+1={mae_t1:.4f} rmse_t+1={rmse_t1:.4f} "
+                f"mae{w}={mae_w:.4f} rmse{w}={rmse_w:.4f}"
+            )
+        else:
+            print(
+                f"[online] step={step} ts={ts_now} "
+                f"mae_t+1={mae_t1:.4f} rmse_t+1={rmse_t1:.4f} "
+                f"(warming up {len(err_mae_window)}/{w})"
+            )
+
     quit_requested = False
 
     try:
@@ -217,6 +259,22 @@ def run_online(cfg: AppConfig) -> None:
                 prediction_horizon=prediction_horizon,
             )
 
+            # Online metrics in scaled-diff space for t+1
+            # (unitless; comparable across variables)
+            true_t1_scaled = scaled[t, :]
+            err_t1_scaled = preds_scaled[0] - true_t1_scaled
+            mae_t1_scaled = float(np.mean(np.abs(err_t1_scaled)))
+            rmse_t1_scaled = float(np.sqrt(np.mean(err_t1_scaled**2)))
+            err_mae_window.append(mae_t1_scaled)
+            err_rmse_window.append(rmse_t1_scaled)
+
+            _maybe_print_status(ts_now, current_step, mae_t1_scaled, rmse_t1_scaled)
+
+            # Training sample for potential fine-tune (multistep)
+            y_true_scaled = scaled[t : t + prediction_horizon, :].reshape(-1)
+            train_X.append(context.copy())
+            train_y.append(y_true_scaled.copy())
+
             # Back to diff scale
             preds_diff = []
             for step_pred in preds_scaled:
@@ -237,6 +295,50 @@ def run_online(cfg: AppConfig) -> None:
             # Metrics + plotting alignment (forecast-style):
             # prediction made at ts_now for ts_t1 is plotted at ts_t1 and scored against actual(ts_t1).
             actual_t1 = df_forecasting.loc[ts_t1, variables].to_numpy(dtype=float)
+
+            # Trigger small fine-tune if rolling error is high
+            if (
+                fcfg.online_finetune_enabled
+                and len(err_mae_window) >= int(fcfg.online_error_window)
+                and (current_step - last_finetune_step) >= int(fcfg.online_finetune_cooldown_steps)
+            ):
+                rolling_mae = float(np.mean(err_mae_window))
+                rolling_rmse = float(np.mean(err_rmse_window))
+
+                if rolling_mae > float(fcfg.online_error_mae_threshold):
+                    try:
+                        X_ft = np.asarray(train_X)
+                        y_ft = np.asarray(train_y)
+                        if X_ft.size and y_ft.size:
+                            ft_started = time.perf_counter()
+                            f_model.compile(
+                                optimizer=keras.optimizers.Adam(learning_rate=float(fcfg.online_finetune_learning_rate)),
+                                loss="mse",
+                            )
+                            print(
+                                f"[online-finetune] step={current_step} ts={ts_now} "
+                                f"mae{int(fcfg.online_error_window)}={rolling_mae:.4f} (thr {float(fcfg.online_error_mae_threshold):.4f}) "
+                                f"samples={len(train_X)} epochs={int(fcfg.online_finetune_epochs)} lr={float(fcfg.online_finetune_learning_rate):.2e}"
+                            )
+                            history = f_model.fit(
+                                X_ft,
+                                y_ft,
+                                epochs=int(fcfg.online_finetune_epochs),
+                                batch_size=int(fcfg.online_finetune_batch_size),
+                                verbose=0,
+                                shuffle=False,
+                            )
+                            ft_s = time.perf_counter() - ft_started
+                            try:
+                                loss = float(history.history.get("loss", [None])[-1])
+                            except Exception:
+                                loss = float("nan")
+                            print(f"[online-finetune] done in {ft_s:.2f}s loss={loss:.6f}")
+                            last_finetune_step = current_step
+                    except Exception as e:
+                        msg = f"{type(e).__name__}: {e}"
+                        print(f"Online fine-tune error: {msg}")
+                        exceptions.append({"where": "online_finetune", "timestamp": str(ts_now), "message": msg})
 
             # Classification on most recent window (raw, not differenced)
             cls_result = None

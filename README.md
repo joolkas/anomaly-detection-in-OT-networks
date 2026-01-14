@@ -23,6 +23,8 @@ pip install -r requirements.txt
             - `train-all`
             - `online`
 
+    # 3) 
+
 # 3. Run the program:
     A. Data preprocessing:
         - set:
@@ -32,7 +34,7 @@ pip install -r requirements.txt
         - run:
 
             ```bash
-            python -m industrial_network_analysis_v2.main
+            python -m anomaly-detection-in-OT-networks.main
             ```
 
     B. Train the forecasting model:
@@ -43,7 +45,7 @@ pip install -r requirements.txt
         - run:
 
             ```bash
-            python -m industrial_network_analysis_v2.main
+            python -m anomaly-detection-in-OT-networks.main
             ```
 
     C. Train the classification model:
@@ -54,7 +56,7 @@ pip install -r requirements.txt
         - run:
 
             ```bash
-            python -m industrial_network_analysis_v2.main
+            python -m anomaly-detection-in-OT-networks.main
             ```
 
     D. Run the program, online forecasting with classifiction + dashboard display:
@@ -65,13 +67,21 @@ pip install -r requirements.txt
         - run:
 
             ```bash
-            python -m industrial_network_analysis_v2.main
+            python -m anomaly-detection-in-OT-networks.main
             ```
 
         - see the live results:
 
             open "http://127.0.0.1:8050", configured in config.json (`dashboard.host`, dashboard.port`)
 
-    IMPORTANT: You can run everything in one command by using:
+        - refresh/step rate:
+
+            `dashboard.update_interval_ms` controls both the dashboard refresh and the online processing step interval.
+
+        - graceful quit:
+
+            press `q` to stop; the program prints a summary (last 24h of processed steps, or what is available) and saves it under `artifacts/online/summary_*.json`.
+
+    # IMPORTANT: You can run everything in one command by using:
 
         run.mode = "train-all"

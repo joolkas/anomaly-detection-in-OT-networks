@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import time
+
 import numpy as np
 import pandas as pd
 
@@ -8,6 +12,123 @@ from .config import AppConfig
 from .dashboard import DashRealTimePlotter
 from .train_forecasting import load_artifacts as load_forecasting
 from .train_classification import load_artifacts as load_classification
+
+
+@dataclass
+class _StepRecord:
+    timestamp: pd.Timestamp
+    actual_t1: np.ndarray
+    pred_t1: np.ndarray
+    classification: str | None
+    confidence: float | None
+
+
+def _quit_requested() -> bool:
+    """Best-effort non-blocking key check for quitting.
+
+    On Windows consoles, this supports immediate single-key quit using msvcrt.
+    """
+    try:
+        import msvcrt  # type: ignore
+
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            return ch in ("q", "Q")
+        return False
+    except Exception:
+        return False
+
+
+def _sleep_with_quit_check(duration_s: float) -> bool:
+    """Sleep up to duration_s, returning True if quit was requested."""
+    if duration_s <= 0:
+        return _quit_requested()
+
+    deadline = time.perf_counter() + duration_s
+    while True:
+        if _quit_requested():
+            return True
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.2, remaining))
+
+
+def _compute_summary(
+    records: list[_StepRecord],
+    variable_names: list[str],
+    exceptions: list[dict],
+) -> dict:
+    if not records:
+        return {
+            "steps_processed": 0,
+            "window": {"hours": 24, "available_steps": 0},
+            "forecasting": {},
+            "classification": {},
+            "errors": {"count": len(exceptions), "last": exceptions[-10:]},
+        }
+
+    last_ts = records[-1].timestamp
+    cutoff = last_ts - pd.Timedelta(hours=24)
+    window = [r for r in records if r.timestamp >= cutoff]
+    if not window:
+        window = records
+
+    actual = np.stack([r.actual_t1 for r in window], axis=0)
+    pred = np.stack([r.pred_t1 for r in window], axis=0)
+    err = pred - actual
+
+    mae = np.mean(np.abs(err), axis=0)
+    rmse = np.sqrt(np.mean(err**2, axis=0))
+    bias = np.mean(err, axis=0)
+
+    per_var: dict[str, dict] = {}
+    for i, v in enumerate(variable_names):
+        per_var[v] = {
+            "mae": float(mae[i]),
+            "rmse": float(rmse[i]),
+            "bias": float(bias[i]),
+        }
+
+    overall = {
+        "mae_mean": float(np.mean(mae)),
+        "rmse_mean": float(np.mean(rmse)),
+        "bias_mean": float(np.mean(bias)),
+    }
+
+    cls_names = [r.classification for r in window if r.classification]
+    cls_conf = [r.confidence for r in window if r.confidence is not None]
+    cls_counts: dict[str, int] = {}
+    for name in cls_names:
+        cls_counts[str(name)] = cls_counts.get(str(name), 0) + 1
+
+    storm_like = sum(1 for n in cls_names if "storm" in str(n).lower() or "anomaly" in str(n).lower())
+    normal_like = sum(1 for n in cls_names if "normal" in str(n).lower())
+
+    return {
+        "steps_processed": len(records),
+        "window": {
+            "hours": 24,
+            "available_steps": len(window),
+            "start": str(window[0].timestamp),
+            "end": str(window[-1].timestamp),
+        },
+        "forecasting": {
+            "overall": overall,
+            "per_variable": per_var,
+        },
+        "classification": {
+            "available_steps": len(cls_names),
+            "counts": cls_counts,
+            "storm_like": int(storm_like),
+            "normal_like": int(normal_like),
+            "avg_confidence": float(np.mean(cls_conf)) if cls_conf else None,
+        },
+        "errors": {
+            "count": len(exceptions),
+            "last": exceptions[-10:],
+        },
+    }
 
 
 def _predict_multistep_direct(model, context: np.ndarray, n_features: int, prediction_horizon: int) -> list[np.ndarray]:
@@ -43,6 +164,11 @@ def run_online(cfg: AppConfig) -> None:
     print(f"Open http://{cfg.dashboard.host}:{cfg.dashboard.port} to view dashboard")
     time.sleep(2)
 
+    # Pace the online loop to match the dashboard refresh cadence.
+    step_interval_s = max(0.0, float(cfg.dashboard.update_interval_ms) / 1000.0)
+
+    print("Press 'q' to stop and print a run summary.")
+
     # Forecasting pipeline expects differenced+scaled data
     df_diff = df_forecasting.diff().dropna()
 
@@ -62,86 +188,142 @@ def run_online(cfg: AppConfig) -> None:
     # Main loop
     context = scaled[:context_length].copy()
 
-    for t in range(context_length, len(scaled) - prediction_horizon + 1):
-        current_step = t - context_length
-        ts = df_diff.index[t]
+    records: list[_StepRecord] = []
+    exceptions: list[dict] = []
 
-        # Forecast: scaled diffs
-        preds_scaled = _predict_multistep_direct(f_model, context, n_features=len(variables), prediction_horizon=prediction_horizon)
+    quit_requested = False
 
-        # Back to diff scale
-        preds_diff = []
-        for step_pred in preds_scaled:
-            row = []
-            for i, var in enumerate(variables):
-                row.append(float(f_scalers[var].inverse_transform([[step_pred[i]]])[0, 0]))
-            preds_diff.append(np.array(row))
+    try:
+        for t in range(context_length, len(scaled) - prediction_horizon + 1):
+            step_started = time.perf_counter()
 
-        # Actual diff (t+1)
-        actual_diff_t1 = df_diff.iloc[t + 1][variables].to_numpy(dtype=float)
+            if _quit_requested():
+                quit_requested = True
+                break
 
-        # Inverse differencing (use last actual values from raw)
-        base_idx = min(t, len(df_forecasting) - 1)
-        last_actual = df_forecasting.iloc[base_idx][variables].to_numpy(dtype=float)
+            current_step = t - context_length
+            ts = df_diff.index[t]
 
-        preds_actual = []
-        cur = last_actual.copy()
-        for step_diff in preds_diff:
-            cur = cur + step_diff
-            preds_actual.append(cur.copy())
+            # Forecast: scaled diffs
+            preds_scaled = _predict_multistep_direct(
+                f_model,
+                context,
+                n_features=len(variables),
+                prediction_horizon=prediction_horizon,
+            )
 
-        actual_actual_t1 = last_actual + actual_diff_t1
+            # Back to diff scale
+            preds_diff = []
+            for step_pred in preds_scaled:
+                row = []
+                for i, var in enumerate(variables):
+                    row.append(float(f_scalers[var].inverse_transform([[step_pred[i]]])[0, 0]))
+                preds_diff.append(np.array(row))
 
-        # Classification on most recent window (raw, not differenced)
-        cls_result = None
-        try:
-            # Align by timestamp index if possible; fallback to positional
-            if ts in df_classification.index:
-                end_loc = df_classification.index.get_loc(ts)
-            else:
-                end_loc = min(t, len(df_classification) - 1)
+            # Actual diff (t+1)
+            actual_diff_t1 = df_diff.iloc[t + 1][variables].to_numpy(dtype=float)
 
-            start_loc = max(0, end_loc - c_window + 1)
-            window_df = df_classification.iloc[start_loc : end_loc + 1]
+            # Inverse differencing (use last actual values from raw)
+            base_idx = min(t, len(df_forecasting) - 1)
+            last_actual = df_forecasting.iloc[base_idx][variables].to_numpy(dtype=float)
 
-            window_df = window_df.reindex(columns=c_feature_cols, fill_value=0)
-            X = window_df.to_numpy(dtype=float)
-            Xs = c_scaler.transform(X)
+            preds_actual = []
+            cur = last_actual.copy()
+            for step_diff in preds_diff:
+                cur = cur + step_diff
+                preds_actual.append(cur.copy())
 
-            # Pad if too short
-            if Xs.shape[0] < c_window:
-                pad = np.zeros((c_window - Xs.shape[0], Xs.shape[1]), dtype=float)
-                Xs = np.vstack([pad, Xs])
+            actual_actual_t1 = last_actual + actual_diff_t1
 
-            X_in = Xs.reshape(1, c_window, Xs.shape[1])
-            probs = c_model.predict(X_in, verbose=0)[0]
-            idx = int(np.argmax(probs))
-            conf = float(np.max(probs))
-            name = c_prep.get("label_to_name", {}).get(idx, f"class_{idx}")
+            # Classification on most recent window (raw, not differenced)
+            cls_result = None
+            try:
+                # Align by timestamp index if possible; fallback to positional
+                if ts in df_classification.index:
+                    end_loc = df_classification.index.get_loc(ts)
+                else:
+                    end_loc = min(t, len(df_classification) - 1)
 
-            cls_result = {
-                "timestamp": str(ts),
-                "classification": name,
-                "confidence": conf,
-                "class_index": idx,
-            }
-        except Exception as e:
-            print(f"Classification error: {type(e).__name__}: {e}")
+                start_loc = max(0, end_loc - c_window + 1)
+                window_df = df_classification.iloc[start_loc : end_loc + 1]
+
+                window_df = window_df.reindex(columns=c_feature_cols, fill_value=0)
+                X = window_df.to_numpy(dtype=float)
+                Xs = c_scaler.transform(X)
+
+                # Pad if too short
+                if Xs.shape[0] < c_window:
+                    pad = np.zeros((c_window - Xs.shape[0], Xs.shape[1]), dtype=float)
+                    Xs = np.vstack([pad, Xs])
+
+                X_in = Xs.reshape(1, c_window, Xs.shape[1])
+                probs = c_model.predict(X_in, verbose=0)[0]
+                idx = int(np.argmax(probs))
+                conf = float(np.max(probs))
+                name = c_prep.get("label_to_name", {}).get(idx, f"class_{idx}")
+
+                cls_result = {
+                    "timestamp": str(ts),
+                    "classification": name,
+                    "confidence": conf,
+                    "class_index": idx,
+                }
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                print(f"Classification error: {msg}")
+                exceptions.append({"where": "classification", "timestamp": str(ts), "message": msg})
 
         # Push to dashboard (t+1 actual + horizon predictions)
-        plotter.add_step(
-            timestamp=ts,
-            variable_names=variables,
-            actual_row=actual_actual_t1,
-            predictions_horizon=preds_actual,
-            current_step=current_step,
-            classification_result=cls_result,
-        )
+            plotter.add_step(
+                timestamp=ts,
+                variable_names=variables,
+                actual_row=actual_actual_t1,
+                predictions_horizon=preds_actual,
+                current_step=current_step,
+                classification_result=cls_result,
+            )
+
+            records.append(
+                _StepRecord(
+                    timestamp=pd.Timestamp(ts),
+                    actual_t1=np.array(actual_actual_t1, dtype=float),
+                    pred_t1=np.array(preds_actual[0], dtype=float),
+                    classification=(cls_result or {}).get("classification") if cls_result else None,
+                    confidence=(cls_result or {}).get("confidence") if cls_result else None,
+                )
+            )
 
         # Update context with current observed scaled diff
-        context = np.vstack([context[1:], scaled[t, :]])
+            context = np.vstack([context[1:], scaled[t, :]])
 
-        # Real-time pacing (optional)
-        time.sleep(0.0)
+        # Real-time pacing (optional): run one step per interval.
+            if step_interval_s > 0:
+                elapsed = time.perf_counter() - step_started
+                if _sleep_with_quit_check(max(0.0, step_interval_s - elapsed)):
+                    quit_requested = True
+                    break
+
+    except KeyboardInterrupt:
+        quit_requested = True
+
+    if quit_requested:
+        print("Quit requested. Generating summary...")
+
+    summary = _compute_summary(records=records, variable_names=variables, exceptions=exceptions)
+
+    summary["meta"] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "step_interval_s": float(step_interval_s),
+        "dashboard_url": f"http://{cfg.dashboard.host}:{cfg.dashboard.port}",
+    }
+
+    out_dir = cfg.paths.artifacts_dir / "online"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    summary_path = out_dir / f"summary_{stamp}.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print(f"Summary saved to: {summary_path}")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
 
     print("Online run completed")

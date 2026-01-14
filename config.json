@@ -4,7 +4,7 @@
   },
   "paths": {
     "raw_data_dir": "C:\\Przestrzeń pomoc\\projects\\anomaly-detection-in-OT-networks\\data\\raw",
-    "device_csv_name": "A1-RBX-242.csv",
+    "device_csv_name": "A1-SW-A-245.csv",
     "processed_dir": "./processed",
     "artifacts_dir": "./artifacts"
   },
@@ -12,7 +12,6 @@
     "resample_freq": "min",
     "forecasting_include_keywords": [
       "ICMP response time",
-      "temperature",
       "cpu",
       "used memory",
       "bits"
@@ -64,6 +63,6 @@
     "host": "127.0.0.1",
     "port": 8050,
     "max_points": 60,
-    "update_interval_ms": 60000
+    "update_interval_ms": 5000
   }
 }

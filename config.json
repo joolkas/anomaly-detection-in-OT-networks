@@ -1,0 +1,69 @@
+{
+  "run": {
+    "mode": "online"
+  },
+  "paths": {
+    "raw_data_dir": "C:\\Przestrzeń pomoc\\projects\\anomaly-detection-in-OT-networks\\data\\raw",
+    "device_csv_name": "A1-RBX-242.csv",
+    "processed_dir": "./processed",
+    "artifacts_dir": "./artifacts"
+  },
+  "preprocessing": {
+    "resample_freq": "min",
+    "forecasting_include_keywords": [
+      "ICMP response time",
+      "temperature",
+      "cpu",
+      "used memory",
+      "bits"
+    ],
+    "forecasting_exclude_keywords": [
+      "status"
+    ],
+    "classification_include_keywords": [
+      ": operational status",
+      "bits sent",
+      "bits received"
+    ],
+    "classification_exclude_keywords": [
+      "unused"
+    ],
+    "outlier_z_threshold": 10.0
+  },
+  "forecasting": {
+    "context_length": 60,
+    "prediction_horizon": 6,
+    "lstm_units": [
+      256,
+      128,
+      64
+    ],
+    "dense_units": 256,
+    "activation": "relu",
+    "dropout_rate": 0.2,
+    "epochs": 80,
+    "batch_size": 32,
+    "validation_split": 0.2,
+    "learning_rate": 0.001,
+    "initial_train_minutes": 1440
+  },
+  "classification": {
+    "window_size": 60,
+    "traffic_ratio_threshold": 100.0,
+    "start_bit": 10,
+    "epsilon": 1e-6,
+    "conv1_units": 64,
+    "conv2_units": 128,
+    "dense_units": 64,
+    "dropout_rate": 0.2,
+    "epochs": 50,
+    "batch_size": 32,
+    "validation_split": 0.2
+  },
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8050,
+    "max_points": 60,
+    "update_interval_ms": 60000
+  }
+}

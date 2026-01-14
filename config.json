@@ -1,6 +1,6 @@
 {
   "run": {
-    "mode": "train-all"
+    "mode": "online"
   },
   "paths": {
     "raw_data_dir": "C:\\Przestrzeń pomoc\\projects\\anomaly-detection-in-OT-networks\\data\\raw",
